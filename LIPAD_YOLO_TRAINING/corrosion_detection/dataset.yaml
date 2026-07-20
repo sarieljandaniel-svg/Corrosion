@@ -1,0 +1,8 @@
+path: C:/Users/Admin/Project_LiPAD/Corrosion/LIPAD_YOLO_TRAINING/corrosion_detection/datasets/coco8-seg
+train: images/train
+val: images/val
+nc: 3
+names:
+  0: fair
+  1: poor
+  2: severe
