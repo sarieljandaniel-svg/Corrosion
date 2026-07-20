@@ -13,7 +13,6 @@ dist/
 
 # Datasets, runs & outputs
 datasets/
-runs/
 wandb/
 
 # Python cache & compiled files
