@@ -1,0 +1,14 @@
+[INFO] GSD mode: hypothetical — 0.5436 mm/px
+[INFO] Booting Quantized Project LIPAD Engine with BoT-SORT Tracking...
+[SYSTEM] Quantized model loaded — device: cpu
+  • C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\models\best.onnx
+[SYSTEM] High-Fidelity Processing Canvas Locked: 1124x608
+Loading C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\models\best.onnx for ONNX Runtime inference...
+Using ONNX Runtime 1.28.0 with CPUExecutionProvider
+
+[COMPILE] Unifying and compiling database spreadsheet rows...
+[SUCCESS] Morphological results saved to:
+👉 C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\data\MorphologicalResults.csv
+[SUCCESS] UI mirror results saved to:
+👉 C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\data\results.csv
+[INFO] GSD source used: hypothetical
