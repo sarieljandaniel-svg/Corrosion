@@ -14,6 +14,8 @@ dist/
 # Datasets, runs & outputs
 datasets/
 wandb/
+corrosion_detection/dataset
+
 
 # Python cache & compiled files
 __pycache__/

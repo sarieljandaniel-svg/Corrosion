@@ -13,6 +13,15 @@ from ultralytics import YOLO
 from shared.model_registry import ModelFamily, TaskType, all_families, get_model_spec
 from shared.paths import dataset_yaml_path, ensure_dataset_layout, is_colab, runs_dir, task_root
 
+try:
+    from shared.corrosion_config import CorrosionTrainConfig, config_summary, corrosion_train_kwargs
+    from shared.preprocess_corrosion import write_corrosion_dataset_yaml
+except ImportError:
+    CorrosionTrainConfig = None  # type: ignore[misc, assignment]
+    config_summary = None  # type: ignore[assignment]
+    corrosion_train_kwargs = None  # type: ignore[assignment]
+    write_corrosion_dataset_yaml = None  # type: ignore[assignment]
+
 
 def write_dataset_yaml(task: TaskType, class_name: str) -> Path:
     root = task_root(f"{task}_detection")
@@ -80,6 +89,60 @@ def train(
         close_mosaic=10,
         verbose=True,
     )
+
+    best = Path(project) / name / "weights" / "best.pt"
+    print(f"[LiPAD] Best weights: {best}")
+    return best
+
+
+def train_corrosion(
+    family: ModelFamily,
+    *,
+    config: "CorrosionTrainConfig | None" = None,
+    batch: int | None = None,
+    device: str | int | None = None,
+    workers: int | None = None,
+    project_name: str | None = None,
+    run_name: str | None = None,
+    resume: bool = False,
+) -> Path:
+    """Train corrosion segmentation with Roboflow-aligned hyperparameters."""
+    if corrosion_train_kwargs is None or write_corrosion_dataset_yaml is None:
+        raise ImportError("shared.corrosion_config is required for train_corrosion()")
+
+    task_dir = "corrosion_detection"
+    data_yaml = write_corrosion_dataset_yaml()
+    spec = get_model_spec("corrosion", family)
+
+    if device is None:
+        device = 0 if torch.cuda.is_available() else "cpu"
+    if workers is None:
+        workers = 2 if os.name == "nt" else 4
+        if device == "cpu":
+            workers = 0
+
+    project = project_name or str(runs_dir(task_dir) / family)
+    name = run_name or f"corrosion_{family}_seg"
+
+    print(config_summary())
+    print(f"[LiPAD] Task      : corrosion")
+    print(f"[LiPAD] Model     : {spec.weights} ({spec.description})")
+    print(f"[LiPAD] Data      : {data_yaml}")
+    print(f"[LiPAD] Device    : {device}")
+    print(f"[LiPAD] Colab     : {is_colab()}")
+
+    train_kwargs = corrosion_train_kwargs(
+        config,
+        batch=batch,
+        device=device,
+        workers=workers,
+        project=project,
+        name=name,
+        resume=resume,
+    )
+
+    model = YOLO(spec.weights)
+    model.train(data=str(data_yaml), **train_kwargs)
 
     best = Path(project) / name / "weights" / "best.pt"
     print(f"[LiPAD] Best weights: {best}")

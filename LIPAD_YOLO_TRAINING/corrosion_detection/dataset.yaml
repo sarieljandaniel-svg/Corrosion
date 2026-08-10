@@ -1,4 +1,4 @@
-path: C:/Users/Admin/Project_LiPAD/Corrosion/LIPAD_YOLO_TRAINING/corrosion_detection/datasets/coco8-seg
+path: corrosion_detection/datasets
 train: images/train
 val: images/val
 nc: 3
