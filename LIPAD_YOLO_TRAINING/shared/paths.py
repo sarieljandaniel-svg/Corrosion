@@ -68,6 +68,15 @@ def dataset_yaml_path(task: str) -> Path:
 
 
 def datasets_dir(task: str) -> Path:
+    if is_colab() and task == "corrosion_detection":
+        drive_dataset = Path(
+            "/content/drive/MyDrive/"
+            "LIPAD_TRAINING_VERSION2/datasets/corrosion/dataset"
+        )
+
+        if drive_dataset.exists():
+            return drive_dataset
+
     return task_root(task) / "datasets"
 
 
