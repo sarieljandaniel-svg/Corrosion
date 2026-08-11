@@ -25,7 +25,7 @@ CRACK_MODELS: dict[ModelFamily, ModelSpec] = {
 }
 
 CORROSION_MODELS: dict[ModelFamily, ModelSpec] = {
-    "yolov8": ModelSpec("yolov8", "yolov8n-seg.pt", "YOLOv8 nano segmentation (corrosion)"),
+    "yolov8": ModelSpec("yolov8", "yolov8m-seg.pt", "YOLOv8 medium segmentation (corrosion)"),
     "yolov11": ModelSpec("yolov11", "yolo11n-seg.pt", "YOLOv11 nano segmentation (corrosion)"),
     "yolov12": ModelSpec("yolov12", "yolo12n-seg.yaml", "YOLOv12 nano segmentation (architecture; no seg .pt in Ultralytics 8.4+)"),
     "yolov26": ModelSpec("yolov26", "yolo26n-seg.pt", "YOLOv26 nano segmentation (pretrained, corrosion)"),
