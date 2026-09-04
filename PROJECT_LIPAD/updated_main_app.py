@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import time
 
 import customtkinter as ctk
 import pandas as pd
+from PIL import Image
 from tkinter import filedialog
 
 from ui.components import body_label, newsprint_button
@@ -67,6 +70,21 @@ class LipadQuantizedApp(ctk.CTk):
         self.telemetry_log = None
         self.current_lidar_distance = dist_ref
         self._telemetry_packets: list[TelemetryPacket] = []
+
+        self.live_pc_ip = ctk.StringVar(value="192.168.1.47")
+        self.live_listen_host = ctk.StringVar(value="0.0.0.0")
+        self.live_listen_port = ctk.StringVar(value="5000")
+        self.live_width = ctk.StringVar(value="1280")
+        self.live_height = ctk.StringVar(value="720")
+        self.live_bitrate = ctk.StringVar(value="3000000")
+        self.pi_ssh_host = ctk.StringVar(value="")
+        self.pi_ssh_user = ctk.StringVar(value="pi")
+        self.live_auto_ssh = ctk.BooleanVar(value=False)
+        self._live_running = False
+        self._pi_ssh_process = None
+        self._live_preview_job = None
+        self._live_preview_imgtk = None
+        self._live_preview_mtime = None
 
         self._shell = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         self._shell.pack(fill="both", expand=True)
@@ -212,6 +230,12 @@ class LipadQuantizedApp(ctk.CTk):
             render_reports(self, content, self.tokens)
 
         self._build_shell()
+        if name == "inspection_manager":
+            self._refresh_rpicam_command_box()
+            if self._live_running:
+                self._schedule_live_preview()
+        elif name == "analysis_overview" and self._live_running:
+            self._schedule_live_preview()
 
     def set_inspection(self, target: str) -> None:
         self.selected_inspection.set(target)
@@ -323,23 +347,62 @@ class LipadQuantizedApp(ctk.CTk):
         except Exception as e:
             self._set_status(f"Failed to open folder: {e}")
 
-    def run_engine_from_ui(self) -> None:
-        if not self.uploaded_video_path:
-            self._set_status("No MP4 selected. Add/select a video first.")
+    def _live_preview_path(self) -> str:
+        return os.path.join(self._data_dir(), "live_preview.jpg")
+
+    def _parse_live_settings(self) -> tuple[str, str, int, int, int, int]:
+        host = (self.live_listen_host.get() or "0.0.0.0").strip()
+        pc_ip = (self.live_pc_ip.get() or "192.168.1.47").strip()
+        try:
+            port = int(float(self.live_listen_port.get()))
+        except Exception:
+            port = 5000
+        try:
+            width = int(float(self.live_width.get()))
+        except Exception:
+            width = 1280
+        try:
+            height = int(float(self.live_height.get()))
+        except Exception:
+            height = 720
+        try:
+            bitrate = int(float(self.live_bitrate.get()))
+        except Exception:
+            bitrate = 3_000_000
+        return host, pc_ip, port, width, height, bitrate
+
+    def rpicam_command_text(self) -> str:
+        _host, pc_ip, port, width, height, bitrate = self._parse_live_settings()
+        return (
+            "rpicam-vid -t 0 "
+            f"--width {width} --height {height} "
+            f"--bitrate {bitrate} --inline "
+            "--codec libav --libav-format mpegts "
+            f"-o tcp://{pc_ip}:{port}"
+        )
+
+    def _refresh_rpicam_command_box(self) -> None:
+        if not hasattr(self, "rpicam_cmd_box") or not self.rpicam_cmd_box.winfo_exists():
             return
-        with self.engine_lock:
-            if self.engine_process is not None:
-                self._set_status("Engine already running. Stop it first.")
-                return
-            self.engine_stop_requested = False
+        cmd = self.rpicam_command_text()
+        self.rpicam_cmd_box.configure(state="normal")
+        self.rpicam_cmd_box.delete("0.0", "end")
+        self.rpicam_cmd_box.insert("0.0", cmd)
+        self.rpicam_cmd_box.configure(state="disabled")
 
-        os.makedirs(self._data_dir(), exist_ok=True)
-        annotated_dir = os.path.join(self._data_dir(), "annotated")
-        os.makedirs(annotated_dir, exist_ok=True)
-        base = os.path.splitext(os.path.basename(self.uploaded_video_path))[0]
-        annotated_video = os.path.join(annotated_dir, f"{base}_annotated.mp4")
-        self.last_annotated_video_path = annotated_video
+    def _engine_common_args(self, gsd: float, stride: int, inf_w: int, inspection: str, corrosion_env: str) -> list[str]:
+        return [
+            "--gsd", str(gsd),
+            "--output_csv", self._morph_results_path(),
+            "--results_csv", self._ui_results_path(),
+            "--no_preview",
+            "--frame_stride", str(stride),
+            "--inference_width", str(inf_w),
+            "--inspection_type", inspection,
+            "--corrosion_env", corrosion_env,
+        ]
 
+    def _parse_engine_tuning(self) -> tuple[float, int, int, str, str]:
         try:
             gsd = float(self.gsd_value.get())
         except Exception:
@@ -352,27 +415,234 @@ class LipadQuantizedApp(ctk.CTk):
             inf_w = max(0, int(float(self.inference_width_value.get())))
         except Exception:
             inf_w = 0
-
         inspection = self.selected_inspection.get() or "Crack"
         corrosion_env = self.selected_corrosion_type.get() or "Wet"
+        return gsd, stride, inf_w, inspection, corrosion_env
+
+    def _crack_weights_or_status(self, inspection: str) -> str | None:
+        if inspection.lower() != "crack":
+            return None
+        weights = self.weights_path
+        if not os.path.exists(weights):
+            self._set_status(f"Quantized YOLO model missing: {weights}")
+            return ""
+        return weights
+
+    def _live_ready_flag_path(self) -> str:
+        return os.path.join(self._data_dir(), "live_ready.flag")
+
+    def copy_rpicam_command(self) -> None:
+        cmd = self.rpicam_command_text()
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(cmd)
+            self._set_status("Copied rpicam-vid command to clipboard.")
+        except Exception as e:
+            self._set_status(f"Clipboard copy failed: {e}")
+
+    def _apply_preview_image(self, lbl) -> None:
+        if lbl is None or not lbl.winfo_exists():
+            return
+        path = self._live_preview_path()
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if mtime == self._live_preview_mtime and getattr(lbl, "_lipad_mtime", None) == mtime:
+            return
+        try:
+            img = Image.open(path)
+            img.load()
+            img = img.convert("RGB")
+            img.thumbnail((640, 360))
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+            self._live_preview_imgtk = ctk_img
+            self._live_preview_mtime = mtime
+            lbl._lipad_mtime = mtime
+            lbl.configure(image=ctk_img, text="")
+        except Exception:
+            pass
+
+    def _schedule_live_preview(self) -> None:
+        if self._live_preview_job is not None:
+            try:
+                self.after_cancel(self._live_preview_job)
+            except Exception:
+                pass
+            self._live_preview_job = None
+        self._tick_live_preview()
+
+    def _tick_live_preview(self) -> None:
+        self._live_preview_job = None
+        if not self._live_running:
+            return
+        self._apply_preview_image(getattr(self, "live_preview_lbl", None))
+        self._apply_preview_image(getattr(self, "analysis_live_preview_lbl", None))
+        self._live_preview_job = self.after(40, self._tick_live_preview)
+
+    def _start_pi_rpicam(self) -> None:
+        host = (self.pi_ssh_host.get() or "").strip()
+        user = (self.pi_ssh_user.get() or "pi").strip()
+        if not host:
+            self._set_status("Listener is up. Run the rpicam-vid command on the Pi.")
+            return
+        if shutil.which("ssh") is None:
+            self._set_status("ssh not found. Run the rpicam-vid command on the Pi instead.")
+            return
+        remote = self.rpicam_command_text()
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8",
+            f"{user}@{host}",
+            remote,
+        ]
+        try:
+            self._pi_ssh_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._set_status(f"Live analysis listening — started rpicam on {user}@{host}")
+        except Exception as e:
+            self._pi_ssh_process = None
+            self._set_status(f"SSH rpicam failed ({e}). Run the command on the Pi.")
+
+    def _stop_pi_rpicam(self) -> None:
+        proc = self._pi_ssh_process
+        self._pi_ssh_process = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        host = (self.pi_ssh_host.get() or "").strip()
+        user = (self.pi_ssh_user.get() or "pi").strip()
+        if host and shutil.which("ssh"):
+            try:
+                subprocess.Popen(
+                    [
+                        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                        f"{user}@{host}",
+                        "pkill -f rpicam-vid || true",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
+    def start_live_engine_from_ui(self) -> None:
+        with self.engine_lock:
+            if self.engine_process is not None:
+                self._set_status("Engine already running. Stop it first.")
+                return
+            self.engine_stop_requested = False
+            self._live_running = True
+
+        gsd, stride, inf_w, inspection, corrosion_env = self._parse_engine_tuning()
+        host, _pc_ip, port, width, height, _bitrate = self._parse_live_settings()
+        os.makedirs(self._data_dir(), exist_ok=True)
+        preview = self._live_preview_path()
+        ready_flag = self._live_ready_flag_path()
+        for stale in (preview, ready_flag):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
+        self._live_preview_mtime = None
+
+        cmd = [
+            sys.executable, self._engine_script_path(),
+            "--live",
+            "--listen_host", host,
+            "--listen_port", str(port),
+            "--stream_width", str(width),
+            "--stream_height", str(height),
+            "--preview_jpeg", preview,
+            "--ready_flag", ready_flag,
+            *self._engine_common_args(gsd, stride, inf_w, inspection, corrosion_env),
+        ]
+        weights = self._crack_weights_or_status(inspection)
+        if weights == "":
+            self._live_running = False
+            return
+        if weights:
+            cmd.extend(["--weights", weights])
+
+        def _runner() -> None:
+            self.after(0, lambda: self._set_status(
+                f"Listening on {host}:{port} (like ffplay -listen 1). Start rpicam-vid on the Pi."
+            ))
+            self.after(0, self._schedule_live_preview)
+            log_file_path = os.path.join(self._data_dir(), "engine_error.log")
+            try:
+                with open(log_file_path, "w") as log_file:
+                    with self.engine_lock:
+                        self.engine_process = subprocess.Popen(
+                            cmd, stdout=log_file, stderr=log_file, text=True
+                        )
+                        proc = self.engine_process
+                    deadline = time.time() + 25
+                    while time.time() < deadline:
+                        if os.path.exists(ready_flag) or proc.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                    if self.live_auto_ssh.get() and proc.poll() is None:
+                        self.after(0, self._start_pi_rpicam)
+                    elif os.path.exists(ready_flag) and proc.poll() is None:
+                        self.after(0, lambda: self._set_status(
+                            f"Listener ready on {host}:{port}. Run rpicam-vid on the Pi now."
+                        ))
+                    code = proc.wait()
+
+                with self.engine_lock:
+                    stopped = self.engine_stop_requested
+                    self.engine_process = None
+                    self.engine_stop_requested = False
+                self._live_running = False
+                self._stop_pi_rpicam()
+                self.last_output_csv_path = self._morph_results_path()
+                if code != 0:
+                    self.after(0, lambda: self._set_status(
+                        "Live analysis stopped." if stopped else "Live engine failed. Check data/engine_error.log"
+                    ))
+                    return
+                self.after(0, lambda: self._set_status("Live analysis complete. Open Analysis Overview."))
+            except Exception as ex:
+                with self.engine_lock:
+                    self.engine_process = None
+                self._live_running = False
+                self._stop_pi_rpicam()
+                self.after(0, lambda: self._set_status(f"Live engine error: {ex}"))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def run_engine_from_ui(self) -> None:
+        if not self.uploaded_video_path:
+            self._set_status("No MP4 selected. Add/select a video first.")
+            return
+        with self.engine_lock:
+            if self.engine_process is not None:
+                self._set_status("Engine already running. Stop it first.")
+                return
+            self.engine_stop_requested = False
+            self._live_running = False
+
+        os.makedirs(self._data_dir(), exist_ok=True)
+        annotated_dir = os.path.join(self._data_dir(), "annotated")
+        os.makedirs(annotated_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(self.uploaded_video_path))[0]
+        annotated_video = os.path.join(annotated_dir, f"{base}_annotated.mp4")
+        self.last_annotated_video_path = annotated_video
+        gsd, stride, inf_w, inspection, corrosion_env = self._parse_engine_tuning()
         cmd = [
             sys.executable, self._engine_script_path(),
             "--video", self.uploaded_video_path,
-            "--gsd", str(gsd),
-            "--output_csv", self._morph_results_path(),
-            "--results_csv", self._ui_results_path(),
-            "--no_preview",
-            "--frame_stride", str(stride),
-            "--inference_width", str(inf_w),
             "--output_video", annotated_video,
-            "--inspection_type", inspection,
-            "--corrosion_env", corrosion_env,
+            *self._engine_common_args(gsd, stride, inf_w, inspection, corrosion_env),
         ]
-        if inspection.lower() == "crack":
-            weights = self.weights_path
-            if not os.path.exists(weights):
-                self._set_status(f"Quantized YOLO model missing: {weights}")
-                return
+        weights = self._crack_weights_or_status(inspection)
+        if weights == "":
+            return
+        if weights:
             cmd.extend(["--weights", weights])
 
         def _runner() -> None:
@@ -416,12 +686,28 @@ class LipadQuantizedApp(ctk.CTk):
         if proc is None:
             self._set_status("No analysis running.")
             return
+        self._terminate_engine_process(proc)
+        self._live_running = False
+        self._stop_pi_rpicam()
+        self._set_status("Stopping analysis...")
+
+    def _terminate_engine_process(self, proc: subprocess.Popen) -> None:
         try:
-            proc.terminate()
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                proc.terminate()
             proc.wait(timeout=3)
         except Exception:
-            proc.kill()
-        self._set_status("Stopping analysis...")
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def export_report_csv(self) -> None:
         src = self._morph_results_path()
@@ -468,6 +754,12 @@ class LipadQuantizedApp(ctk.CTk):
             self._set_status(f"Failed to open video: {e}")
 
     def destroy(self) -> None:
+        self._live_running = False
+        self._stop_pi_rpicam()
+        with self.engine_lock:
+            proc = self.engine_process
+        if proc is not None:
+            self._terminate_engine_process(proc)
         self._telemetry.stop()
         super().destroy()
 

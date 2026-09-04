@@ -78,6 +78,28 @@ def render_analysis(app, parent, tokens: ThemeTokens) -> None:
     newsprint_button(actions, tokens, "Clear", command=app.clear_results, variant="secondary").pack(side="left", padx=(0, 8))
     newsprint_button(actions, tokens, "Watch video", command=app.watch_last_video, variant="secondary").pack(side="left")
 
+    if getattr(app, "_live_running", False):
+        live_card = newsprint_card(parent, tokens)
+        live_card.pack(fill="x", pady=(0, 16))
+        lv = ctk.CTkFrame(live_card, fg_color="transparent")
+        lv.pack(fill="x", padx=16, pady=14)
+        meta_label(lv, tokens, "Live engine output").pack(anchor="w")
+        body_label(
+            lv,
+            tokens,
+            "Annotated IMX519 frames from the runtime engine. Refresh the table to pull the latest CSV snapshot.",
+            wraplength=720,
+        ).pack(anchor="w", pady=(4, 8))
+        app.analysis_live_preview_lbl = ctk.CTkLabel(
+            lv,
+            text="Waiting for annotated live frames…",
+            text_color=tokens.muted,
+            font=mono_font(12),
+            width=640,
+            height=280,
+        )
+        app.analysis_live_preview_lbl.pack(anchor="w")
+
     summary = {"total": 0, "cracks": 0, "corrosion": 0, "latest_severity": "—"}
     if df is not None and not df.empty:
         summary["total"] = len(df)

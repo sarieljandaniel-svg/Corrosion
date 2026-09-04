@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from live_tcp_capture import PreviewJpegPublisher, mark_listen_ready, open_video_source
+
 # --- GSD MODE 1: Hypothetical calibration ---
 GSD_HYPOTHETICAL_MM_PER_PX = 0.5436
 
@@ -39,7 +41,28 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Project LIPAD Quantized Structural Health Analytics Engine"
     )
-    parser.add_argument("--video", type=str, required=True, help="Path to MP4 video file")
+    parser.add_argument("--video", type=str, default=None, help="Path to MP4 video file (not required for --live)")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Listen for IMX519 MPEG-TS over TCP (rpicam-vid → this PC).",
+    )
+    parser.add_argument("--listen_host", type=str, default="0.0.0.0", help="TCP listen bind address")
+    parser.add_argument("--listen_port", type=int, default=5000, help="TCP listen port")
+    parser.add_argument("--stream_width", type=int, default=1280, help="Expected live stream width")
+    parser.add_argument("--stream_height", type=int, default=720, help="Expected live stream height")
+    parser.add_argument(
+        "--preview_jpeg",
+        type=str,
+        default=None,
+        help="Atomic JPEG path for the desktop app live view (annotated frames).",
+    )
+    parser.add_argument(
+        "--ready_flag",
+        type=str,
+        default=None,
+        help="Touch this file once the TCP listener is bound so the app can start rpicam-vid.",
+    )
     parser.add_argument(
         "--weights",
         type=str,
@@ -357,6 +380,137 @@ def edge_guided_contour_snap(gray_frame, box, mask_contour):
 
     return mask_contour
 
+
+def _run_corrosion_live(args, base_gsd, source_label, annotate_corrosion_frame, patch_stats_to_rows):
+    source = open_video_source(
+        args.video,
+        live=True,
+        listen_host=args.listen_host,
+        listen_port=args.listen_port,
+        stream_width=args.stream_width,
+        stream_height=args.stream_height,
+    )
+    mark_listen_ready(getattr(args, "ready_flag", None))
+    publisher = PreviewJpegPublisher(args.preview_jpeg) if args.preview_jpeg else None
+    patch_stats: dict[int, dict] = {}
+    next_patch_id = 1
+    frame_idx = 0
+    processed = 0
+    native_w = int(getattr(source, "width", args.stream_width) or args.stream_width)
+    native_h = int(getattr(source, "height", args.stream_height) or args.stream_height)
+    try:
+        while True:
+            ok, frame = source.read(timeout=2.0)
+            if not ok:
+                if getattr(source, "eof", False):
+                    break
+                continue
+            native_h, native_w = frame.shape[:2]
+            frame_idx += 1
+            if args.frame_stride > 1 and (frame_idx % args.frame_stride) != 0:
+                continue
+            processed += 1
+            if args.max_frames and processed > args.max_frames:
+                break
+            display, next_patch_id = annotate_corrosion_frame(
+                frame, args.corrosion_env, patch_stats, next_patch_id
+            )
+            if publisher is not None:
+                publisher.publish(display)
+            if processed % 30 == 0:
+                rows = patch_stats_to_rows(
+                    patch_stats,
+                    base_gsd,
+                    args.corrosion_env,
+                    native_w,
+                    native_h,
+                    source_label,
+                    "",
+                )
+                _write_csv_rows(args.output_csv, rows)
+                if args.results_csv:
+                    _write_csv_rows(args.results_csv, rows)
+            if not args.no_preview:
+                cv2.imshow("Project LIPAD AI - Live Corrosion", display)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    finally:
+        source.close()
+        if publisher is not None:
+            publisher.close()
+        if not args.no_preview:
+            cv2.destroyAllWindows()
+    return patch_stats_to_rows(
+        patch_stats,
+        base_gsd,
+        args.corrosion_env,
+        native_w,
+        native_h,
+        source_label,
+        "",
+    )
+
+
+def _compile_crack_rows(
+    tracked_cracks: dict,
+    track_id_to_label: dict,
+    source_label: str,
+    annotated_video_path: str | None,
+    last_effective_gsd: float,
+) -> list[dict]:
+    unified_spreadsheet_data: dict[str, dict] = {}
+    for track_id, data in tracked_cracks.items():
+        if track_id not in track_id_to_label:
+            continue
+        assigned_label = track_id_to_label[track_id]
+        if assigned_label not in unified_spreadsheet_data:
+            unified_spreadsheet_data[assigned_label] = {
+                "lengths": [], "widths": [], "orientations": [], "areas": [], "frames": 0
+            }
+        unified_spreadsheet_data[assigned_label]["lengths"].extend(data["lengths"])
+        unified_spreadsheet_data[assigned_label]["widths"].extend(data["widths"])
+        unified_spreadsheet_data[assigned_label]["orientations"].extend(data["orientations"])
+        unified_spreadsheet_data[assigned_label]["areas"].extend(data["areas"])
+        unified_spreadsheet_data[assigned_label]["frames"] += data["seen_frames"]
+
+    master_object_log = []
+    for assigned_label in sorted(
+        unified_spreadsheet_data.keys(), key=lambda x: int(x.split("#")[1]) if "#" in x else 0
+    ):
+        metrics = unified_spreadsheet_data[assigned_label]
+        raw_max_len = np.max(metrics["lengths"])
+        final_wid = np.median(metrics["widths"])
+        final_ori = np.median(metrics["orientations"])
+        raw_max_are = np.max(metrics["areas"])
+        if final_wid > 6.0 or (80.0 <= abs(final_ori) <= 90.0):
+            continue
+        if assigned_label == "Crack#1" or final_ori < -30.0:
+            perspective_scaling_factor = 2.473
+            final_len = raw_max_len * perspective_scaling_factor
+            final_are = raw_max_are * perspective_scaling_factor
+        else:
+            final_len = raw_max_len
+            final_are = raw_max_are
+        critical = 1 if (abs(final_ori) > 30.0 and final_wid > 0.30) else 0
+        severity = _severity_from_metrics(final_wid, critical)
+        master_object_log.append({
+            "TimestampUTC": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "Video": source_label,
+            "Annotated_Video": annotated_video_path or "",
+            "Type": "Crack",
+            "Severity": severity,
+            "Crack_ID": assigned_label,
+            "Avg_Length_mm": round(final_len, 2),
+            "Avg_Width_mm": round(final_wid, 4),
+            "Avg_Orientation_Deg": round(final_ori, 1),
+            "Avg_Area_mm2": round(final_are, 2),
+            "Total_Frames_Tracked": metrics["frames"],
+            "Critical_Shear_Alert": int(critical),
+            "GSD_mm_per_px": round(last_effective_gsd, 6),
+        })
+    return master_object_log
+
+
 def main():
     args = parse_arguments()
     repo_root = _resolve_repo_root()
@@ -376,23 +530,38 @@ def main():
         print(f"[INFO] GSD mode: hypothetical — {GSD_HYPOTHETICAL_MM_PER_PX} mm/px")
 
     print("[INFO] Booting Quantized Project LIPAD Engine with BoT-SORT Tracking...")
-    if not os.path.exists(args.video):
-        print(f"[CRITICAL ERROR] Video missing: {args.video}", file=sys.stderr)
-        sys.exit(1)
+    if not args.live:
+        if not args.video:
+            print("[CRITICAL ERROR] --video is required unless --live is set", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(args.video):
+            print(f"[CRITICAL ERROR] Video missing: {args.video}", file=sys.stderr)
+            sys.exit(1)
+
+    source_label = (
+        f"tcp://{args.listen_host}:{args.listen_port}"
+        if args.live
+        else os.path.abspath(args.video)
+    )
 
     inspection = (args.inspection_type or "Crack").strip()
     if inspection.lower() == "corrosion":
         try:
-            from corrosion_analyzer import analyze_corrosion_video
+            from corrosion_analyzer import analyze_corrosion_video, annotate_corrosion_frame, patch_stats_to_rows
             print(f"[INFO] Corrosion mode ({args.corrosion_env}) — HSV/YCrCb pipeline")
-            rows = analyze_corrosion_video(
-                video_path=args.video,
-                gsd_mm_per_px=base_gsd,
-                environment=args.corrosion_env,
-                frame_stride=max(1, int(args.frame_stride)),
-                max_frames=int(args.max_frames or 0),
-                output_video=args.output_video,
-            )
+            if args.live:
+                rows = _run_corrosion_live(
+                    args, base_gsd, source_label, annotate_corrosion_frame, patch_stats_to_rows
+                )
+            else:
+                rows = analyze_corrosion_video(
+                    video_path=args.video,
+                    gsd_mm_per_px=base_gsd,
+                    environment=args.corrosion_env,
+                    frame_stride=max(1, int(args.frame_stride)),
+                    max_frames=int(args.max_frames or 0),
+                    output_video=args.output_video,
+                )
             if not rows:
                 print("\n[INFO] Complete. No validated corrosion patches found.")
             _write_csv_rows(args.output_csv, rows)
@@ -408,7 +577,25 @@ def main():
         print(f"[CRITICAL ERROR] Quantized weights missing: {args.weights}", file=sys.stderr)
         sys.exit(1)
 
-    model = YOLO(args.weights, task="segment")
+    source = None
+    if args.live:
+        source = open_video_source(
+            args.video,
+            live=True,
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
+            stream_width=args.stream_width,
+            stream_height=args.stream_height,
+        )
+        mark_listen_ready(args.ready_flag)
+        print("[LIVE] TCP listener is bound. Start rpicam-vid on the Pi now.")
+
+    try:
+        model = YOLO(args.weights, task="segment")
+    except Exception:
+        if source is not None:
+            source.close()
+        raise
 
     device_context = "cpu"
     try:
@@ -421,19 +608,27 @@ def main():
     print(f"[SYSTEM] Quantized model loaded — device: {device_context}")
     print(f"  • {args.weights}")
 
-    video_capture = cv2.VideoCapture(args.video)
-    fps = float(video_capture.get(cv2.CAP_PROP_FPS) or 0)
-    if fps <= 0:
-        fps = 30.0
-
-    native_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    native_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if source is None:
+        source = open_video_source(
+            args.video,
+            live=False,
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
+            stream_width=args.stream_width,
+            stream_height=args.stream_height,
+        )
+    fps = float(getattr(source, "fps", 30.0) or 30.0)
+    native_width = int(getattr(source, "width", 0) or 0)
+    native_height = int(getattr(source, "height", 0) or 0)
     print(f"[SYSTEM] High-Fidelity Processing Canvas Locked: {native_width}x{native_height}")
 
     window_title = "Project LIPAD AI - Quantized Telemetry Feed (BoT-SORT)"
     if not args.no_preview:
         cv2.namedWindow(window_title, cv2.WINDOW_GUI_NORMAL)
-        cv2.resizeWindow(window_title, native_width, native_height)
+        if native_width > 0 and native_height > 0:
+            cv2.resizeWindow(window_title, native_width, native_height)
+
+    preview_pub = PreviewJpegPublisher(args.preview_jpeg) if args.preview_jpeg else None
 
     frame_counter = 0
     processed_frame_counter = 0
@@ -446,300 +641,269 @@ def main():
 
     writer = None
     annotated_video_path = None
-    if args.output_video:
+    if args.output_video and not args.live:
         annotated_video_path = os.path.abspath(args.output_video)
         _ensure_parent_dir(annotated_video_path)
 
     last_effective_gsd = base_gsd
 
-    while video_capture.isOpened():
-        success, current_frame = video_capture.read()
-        if not success:
-            break
+    try:
+        while True:
+            success, current_frame = source.read(timeout=2.0)
+            if not success:
+                if getattr(source, "eof", False) or not args.live:
+                    break
+                continue
 
-        frame_counter += 1
-        if args.frame_stride > 1 and (frame_counter % args.frame_stride) != 0:
-            continue
+            if native_width <= 0 or native_height <= 0:
+                native_height, native_width = current_frame.shape[:2]
 
-        processed_frame_counter += 1
-        if args.max_frames and processed_frame_counter > args.max_frames:
-            break
+            frame_counter += 1
+            if args.frame_stride > 1 and (frame_counter % args.frame_stride) != 0:
+                continue
 
-        display_frame = current_frame.copy()
+            processed_frame_counter += 1
+            if args.max_frames and processed_frame_counter > args.max_frames:
+                break
 
-        try:
-            if args.gsd_mode == "lidar" and lidar_reader is not None:
-                distance_mm = lidar_reader.get_distance_mm()
-                if distance_mm is not None:
-                    frame_gsd = _gsd_from_lidar_distance_mm(distance_mm)
-                    gsd_source = "lidar_live"
+            display_frame = current_frame.copy()
+
+            try:
+                if args.gsd_mode == "lidar" and lidar_reader is not None:
+                    distance_mm = lidar_reader.get_distance_mm()
+                    if distance_mm is not None:
+                        frame_gsd = _gsd_from_lidar_distance_mm(distance_mm)
+                        gsd_source = "lidar_live"
+                    else:
+                        frame_gsd = base_gsd
+                        gsd_source = "lidar_fallback_hypothetical"
                 else:
                     frame_gsd = base_gsd
-                    gsd_source = "lidar_fallback_hypothetical"
-            else:
-                frame_gsd = base_gsd
-                gsd_source = "hypothetical"
+                    gsd_source = "hypothetical"
 
-            effective_gsd = float(frame_gsd)
-            inference_frame = current_frame
-            if args.inference_width and args.inference_width > 0 and native_width > 0:
-                scale = args.inference_width / float(native_width)
-                if 0.05 < scale < 1.0:
-                    new_h = max(1, int(native_height * scale))
-                    inference_frame = cv2.resize(
-                        current_frame, (args.inference_width, new_h), interpolation=cv2.INTER_AREA
-                    )
-                    effective_gsd = effective_gsd / scale
+                effective_gsd = float(frame_gsd)
+                inference_frame = current_frame
+                if args.inference_width and args.inference_width > 0 and native_width > 0:
+                    scale = args.inference_width / float(native_width)
+                    if 0.05 < scale < 1.0:
+                        new_h = max(1, int(native_height * scale))
+                        inference_frame = cv2.resize(
+                            current_frame, (args.inference_width, new_h), interpolation=cv2.INTER_AREA
+                        )
+                        effective_gsd = effective_gsd / scale
 
-            last_effective_gsd = effective_gsd
-            display_frame = inference_frame.copy()
-            fh, fw = inference_frame.shape[:2]
+                last_effective_gsd = effective_gsd
+                display_frame = inference_frame.copy()
+                fh, fw = inference_frame.shape[:2]
 
-            if writer is None and annotated_video_path:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(annotated_video_path, fourcc, fps, (fw, fh))
+                if writer is None and annotated_video_path:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(annotated_video_path, fourcc, fps, (fw, fh))
 
-            ## Phase 1 & 5: Execute BoT-SORT Tracking Engine with max_det=75 and TTA (augment=True)
-            inference_results = model.track(
-                source=inference_frame,
-                persist=True,
-                conf=args.conf,
-                iou=args.iou,
-                max_det=5,       # Phase 1
-                augment=False,     # Phase 5: TTA
-                tracker="botsort.yaml",
-                verbose=False,
-                device=device_context,
-            )
+                ## Phase 1 & 5: Execute BoT-SORT Tracking Engine with max_det=75 and TTA (augment=True)
+                inference_results = model.track(
+                    source=inference_frame,
+                    persist=True,
+                    conf=args.conf,
+                    iou=args.iou,
+                    max_det=5,       # Phase 1
+                    augment=False,     # Phase 5: TTA
+                    tracker="botsort.yaml",
+                    verbose=False,
+                    device=device_context,
+                )
 
-            result = inference_results[0]
+                result = inference_results[0]
 
-            if result.boxes is not None and result.boxes.id is not None and result.masks is not None:
-                track_ids = result.boxes.id.int().cpu().tolist()
-                boxes = result.boxes.xyxy.cpu().numpy()
-                confs = result.boxes.conf.cpu().numpy()
-                masks = result.masks.xy
-                # boxes, masks, confs, track_ids = post_nms_mask_merge(boxes, masks, confs, track_ids)
-                gray_inference_frame = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2GRAY)
+                if result.boxes is not None and result.boxes.id is not None and result.masks is not None:
+                    track_ids = result.boxes.id.int().cpu().tolist()
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    confs = result.boxes.conf.cpu().numpy()
+                    masks = result.masks.xy
+                    # boxes, masks, confs, track_ids = post_nms_mask_merge(boxes, masks, confs, track_ids)
+                    gray_inference_frame = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2GRAY)
 
-                # First Pass: Compute structural dimensions for all targets
-                for idx, track_id in enumerate(track_ids):
-                    if idx >= len(masks):
-                        continue
+                    # First Pass: Compute structural dimensions for all targets
+                    for idx, track_id in enumerate(track_ids):
+                        if idx >= len(masks):
+                            continue
 
-                    snapped_contour = edge_guided_contour_snap(gray_inference_frame, boxes[idx], masks[idx])
-                    contour_numpy = np.array(snapped_contour, dtype=np.int32)
+                        snapped_contour = edge_guided_contour_snap(gray_inference_frame, boxes[idx], masks[idx])
+                        contour_numpy = np.array(snapped_contour, dtype=np.int32)
 
-                    if len(contour_numpy) < 5:
-                        continue
+                        if len(contour_numpy) < 5:
+                            continue
 
-                    pixel_area = cv2.contourArea(contour_numpy)
-                    if pixel_area <= 0:
-                        x1, y1, x2, y2 = boxes[idx][:4]
-                        pixel_area = max(1.0, (x2 - x1) * (y2 - y1))
+                        pixel_area = cv2.contourArea(contour_numpy)
+                        if pixel_area <= 0:
+                            x1, y1, x2, y2 = boxes[idx][:4]
+                            pixel_area = max(1.0, (x2 - x1) * (y2 - y1))
 
-                    real_area_mm2 = pixel_area * (effective_gsd ** 2)
+                        real_area_mm2 = pixel_area * (effective_gsd ** 2)
 
-                    pixel_perimeter = cv2.arcLength(contour_numpy, True)
-                    if pixel_perimeter <= 0:
-                        x1, y1, x2, y2 = boxes[idx][:4]
-                        pixel_perimeter = 2 * ((x2 - x1) + (y2 - y1))
+                        pixel_perimeter = cv2.arcLength(contour_numpy, True)
+                        if pixel_perimeter <= 0:
+                            x1, y1, x2, y2 = boxes[idx][:4]
+                            pixel_perimeter = 2 * ((x2 - x1) + (y2 - y1))
 
-                    approx_length_mm = (pixel_perimeter / 2.0) * effective_gsd
-                    if approx_length_mm < 5.0 or real_area_mm2 < 2.0:
-                        continue
+                        approx_length_mm = (pixel_perimeter / 2.0) * effective_gsd
+                        if approx_length_mm < 5.0 or real_area_mm2 < 2.0:
+                            continue
 
-                    avg_width_mm = real_area_mm2 / approx_length_mm
+                        avg_width_mm = real_area_mm2 / approx_length_mm
 
-                    M = cv2.moments(contour_numpy)
-                    if M["m00"] != 0:
-                        theta_rad = 0.5 * np.arctan2(2 * M["mu11"], M["mu20"] - M["mu02"])
-                        angle_degrees = np.degrees(theta_rad)
-                    else:
-                        rect = cv2.minAreaRect(contour_numpy)
-                        angle_degrees = rect[2]
-                        if angle_degrees < -45:
-                            angle_degrees = 90 + angle_degrees
+                        M = cv2.moments(contour_numpy)
+                        if M["m00"] != 0:
+                            theta_rad = 0.5 * np.arctan2(2 * M["mu11"], M["mu20"] - M["mu02"])
+                            angle_degrees = np.degrees(theta_rad)
+                        else:
+                            rect = cv2.minAreaRect(contour_numpy)
+                            angle_degrees = rect[2]
+                            if angle_degrees < -45:
+                                angle_degrees = 90 + angle_degrees
 
-                    if track_id not in tracked_cracks:
-                        tracked_cracks[track_id] = {
-                            "lengths": [], "widths": [], "orientations": [], "areas": [], "seen_frames": 0
-                        }
+                        if track_id not in tracked_cracks:
+                            tracked_cracks[track_id] = {
+                                "lengths": [], "widths": [], "orientations": [], "areas": [], "seen_frames": 0
+                            }
 
-                    tracked_cracks[track_id]["lengths"].append(approx_length_mm)
-                    tracked_cracks[track_id]["widths"].append(avg_width_mm)
-                    tracked_cracks[track_id]["orientations"].append(angle_degrees)
-                    tracked_cracks[track_id]["areas"].append(real_area_mm2)
-                    tracked_cracks[track_id]["seen_frames"] += 1
+                        tracked_cracks[track_id]["lengths"].append(approx_length_mm)
+                        tracked_cracks[track_id]["widths"].append(avg_width_mm)
+                        tracked_cracks[track_id]["orientations"].append(angle_degrees)
+                        tracked_cracks[track_id]["areas"].append(real_area_mm2)
+                        tracked_cracks[track_id]["seen_frames"] += 1
 
-                # Second Pass: Render overlays for confirmed defects
-                hud_index = 0
-                for idx, track_id in enumerate(track_ids):
-                    if track_id not in tracked_cracks:
-                        continue
+                    # Second Pass: Render overlays for confirmed defects
+                    hud_index = 0
+                    for idx, track_id in enumerate(track_ids):
+                        if track_id not in tracked_cracks:
+                            continue
 
-                    presence_ratio = tracked_cracks[track_id]["seen_frames"] / max(1, processed_frame_counter)
+                        presence_ratio = tracked_cracks[track_id]["seen_frames"] / max(1, processed_frame_counter)
 
-                    if tracked_cracks[track_id]["seen_frames"] < 2:
-                        continue
+                        if tracked_cracks[track_id]["seen_frames"] < 2:
+                            continue
 
-                    if presence_ratio < MIN_PRESENCE_RATIO and tracked_cracks[track_id]["seen_frames"] < 10:
-                        continue
+                        if presence_ratio < MIN_PRESENCE_RATIO and tracked_cracks[track_id]["seen_frames"] < 10:
+                            continue
 
-                    raw_median_len = np.median(tracked_cracks[track_id]["lengths"])
-                    run_wid = np.median(tracked_cracks[track_id]["widths"])
-                    run_ori = np.median(tracked_cracks[track_id]["orientations"])
-                    raw_median_are = np.median(tracked_cracks[track_id]["areas"])
+                        raw_median_len = np.median(tracked_cracks[track_id]["lengths"])
+                        run_wid = np.median(tracked_cracks[track_id]["widths"])
+                        run_ori = np.median(tracked_cracks[track_id]["orientations"])
+                        raw_median_are = np.median(tracked_cracks[track_id]["areas"])
 
-                    # --- FILTER GATES: MAX WIDTH & ORIENTATION ANGLE ---
-                    # 1. Cap maximum crack width at 6.0 mm
-                    if run_wid > 6.0:
-                        continue
+                        # --- FILTER GATES: MAX WIDTH & ORIENTATION ANGLE ---
+                        # 1. Cap maximum crack width at 6.0 mm
+                        if run_wid > 6.0:
+                            continue
 
                     
 
-                    if track_id not in track_id_to_label:
-                        matched_label = None
-                        for label_name, profile in label_profiles.items():
-                            if abs(run_ori - profile["orientation"]) < 5.0 and abs(run_wid - profile["width"]) < 1.5:
-                                matched_label = label_name
-                                break
+                        if track_id not in track_id_to_label:
+                            matched_label = None
+                            for label_name, profile in label_profiles.items():
+                                if abs(run_ori - profile["orientation"]) < 5.0 and abs(run_wid - profile["width"]) < 1.5:
+                                    matched_label = label_name
+                                    break
 
-                        if matched_label:
-                            track_id_to_label[track_id] = matched_label
-                        else:
-                            if run_ori < -30.0:
-                                new_label = "Crack#1"
+                            if matched_label:
+                                track_id_to_label[track_id] = matched_label
                             else:
-                                if "Crack#2" not in label_profiles and next_label_id == 1:
-                                    next_label_id = 2
-                                new_label = f"Crack#{next_label_id}"
-                                next_label_id += 1
+                                if run_ori < -30.0:
+                                    new_label = "Crack#1"
+                                else:
+                                    if "Crack#2" not in label_profiles and next_label_id == 1:
+                                        next_label_id = 2
+                                    new_label = f"Crack#{next_label_id}"
+                                    next_label_id += 1
 
-                            track_id_to_label[track_id] = new_label
-                            label_profiles[new_label] = {"orientation": run_ori, "width": run_wid}
+                                track_id_to_label[track_id] = new_label
+                                label_profiles[new_label] = {"orientation": run_ori, "width": run_wid}
 
-                    display_label = track_id_to_label[track_id]
+                        display_label = track_id_to_label[track_id]
 
-                    if display_label == "Crack#1" or run_ori < -30.0:
-                        perspective_scaling_factor = 2.473
-                        run_len = raw_median_len * perspective_scaling_factor
-                        run_are = raw_median_are * perspective_scaling_factor
-                    else:
-                        run_len = raw_median_len
-                        run_are = raw_median_are
+                        if display_label == "Crack#1" or run_ori < -30.0:
+                            perspective_scaling_factor = 2.473
+                            run_len = raw_median_len * perspective_scaling_factor
+                            run_are = raw_median_are * perspective_scaling_factor
+                        else:
+                            run_len = raw_median_len
+                            run_are = raw_median_are
 
-                    is_critical = 1 if (abs(run_ori) > 30.0 and run_wid > 0.30) else 0
-                    alert_text = "CRITICAL SHEAR RISK" if is_critical == 1 else "STRUCTURE SECURE"
-                    hud_color = (0, 0, 255) if is_critical == 1 else (0, 255, 0)
+                        is_critical = 1 if (abs(run_ori) > 30.0 and run_wid > 0.30) else 0
+                        alert_text = "CRITICAL SHEAR RISK" if is_critical == 1 else "STRUCTURE SECURE"
+                        hud_color = (0, 0, 255) if is_critical == 1 else (0, 255, 0)
 
-                    x1, y1, x2, y2 = boxes[idx][:4]
-                    cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), hud_color, 2)
+                        x1, y1, x2, y2 = boxes[idx][:4]
+                        cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), hud_color, 2)
 
-                    contour_numpy = np.array(masks[idx], dtype=np.int32)
-                    cv2.drawContours(display_frame, [contour_numpy], -1, (0, 0, 255), 2)
+                        contour_numpy = np.array(masks[idx], dtype=np.int32)
+                        cv2.drawContours(display_frame, [contour_numpy], -1, (0, 0, 255), 2)
 
-                    hud_x, hud_y = 20, 40 + (hud_index * 115)
-                    hud_index += 1
+                        hud_x, hud_y = 20, 40 + (hud_index * 115)
+                        hud_index += 1
 
-                    cv2.rectangle(display_frame, (hud_x - 10, hud_y - 20), (hud_x + 280, hud_y + 85), (15, 15, 15), -1)
-                    cv2.rectangle(display_frame, (hud_x - 10, hud_y - 20), (hud_x + 280, hud_y + 85), hud_color, 1)
+                        cv2.rectangle(display_frame, (hud_x - 10, hud_y - 20), (hud_x + 280, hud_y + 85), (15, 15, 15), -1)
+                        cv2.rectangle(display_frame, (hud_x - 10, hud_y - 20), (hud_x + 280, hud_y + 85), hud_color, 1)
 
-                    text_data = [
-                        f"Crack ID: {display_label}",
-                        f"Avg_Length_mm: {run_len:.2f}mm",
-                        f"Avg_Width_mm: {run_wid:.4f}mm",
-                        f"Avg_Orientation_Deg: {run_ori:.1f}*",
-                        f"Avg_Area_mm2: {run_are:.2f}mm2",
-                        f"Critical_Shear_Alert: {is_critical} ({alert_text})",
-                    ]
+                        text_data = [
+                            f"Crack ID: {display_label}",
+                            f"Avg_Length_mm: {run_len:.2f}mm",
+                            f"Avg_Width_mm: {run_wid:.4f}mm",
+                            f"Avg_Orientation_Deg: {run_ori:.1f}*",
+                            f"Avg_Area_mm2: {run_are:.2f}mm2",
+                            f"Critical_Shear_Alert: {is_critical} ({alert_text})",
+                        ]
 
-                    for line in text_data:
-                        cv2.putText(
-                            display_frame, line, (hud_x, hud_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA,
-                        )
-                        hud_y += 15
+                        for line in text_data:
+                            cv2.putText(
+                                display_frame, line, (hud_x, hud_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA,
+                            )
+                            hud_y += 15
 
-            if not args.no_preview:
-                cv2.imshow(window_title, display_frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            if writer is not None:
-                writer.write(display_frame)
+                if not args.no_preview:
+                    cv2.imshow(window_title, display_frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                if preview_pub is not None:
+                    preview_pub.publish(display_frame)
+                if writer is not None:
+                    writer.write(display_frame)
+                if args.live and processed_frame_counter % 45 == 0:
+                    live_rows = _compile_crack_rows(
+                        tracked_cracks,
+                        track_id_to_label,
+                        source_label,
+                        annotated_video_path,
+                        last_effective_gsd,
+                    )
+                    _write_csv_rows(args.output_csv, live_rows)
+                    if args.results_csv:
+                        _write_csv_rows(args.results_csv, live_rows)
 
-        except Exception as e:
-            print(f"[FRAME ERROR] {e}")
-            continue
+            except Exception as e:
+                print(f"[FRAME ERROR] {e}")
+                continue
+    finally:
+        source.close()
+        if preview_pub is not None:
+            preview_pub.close()
+        if writer is not None:
+            writer.release()
+        if not args.no_preview:
+            cv2.destroyAllWindows()
+        if lidar_reader:
+            lidar_reader.stop()
 
-    video_capture.release()
-    if writer is not None:
-        writer.release()
-    if not args.no_preview:
-        cv2.destroyAllWindows()
-    if lidar_reader:
-        lidar_reader.stop()
-
-    unified_spreadsheet_data: dict[str, dict] = {}
     print("\n[COMPILE] Unifying and compiling database spreadsheet rows...")
-
-    for track_id, data in tracked_cracks.items():
-        if track_id not in track_id_to_label:
-            continue
-
-        assigned_label = track_id_to_label[track_id]
-        if assigned_label not in unified_spreadsheet_data:
-            unified_spreadsheet_data[assigned_label] = {
-                "lengths": [], "widths": [], "orientations": [], "areas": [], "frames": 0
-            }
-
-        unified_spreadsheet_data[assigned_label]["lengths"].extend(data["lengths"])
-        unified_spreadsheet_data[assigned_label]["widths"].extend(data["widths"])
-        unified_spreadsheet_data[assigned_label]["orientations"].extend(data["orientations"])
-        unified_spreadsheet_data[assigned_label]["areas"].extend(data["areas"])
-        unified_spreadsheet_data[assigned_label]["frames"] += data["seen_frames"]
-
-    master_object_log = []
-    for assigned_label in sorted(
-        unified_spreadsheet_data.keys(), key=lambda x: int(x.split("#")[1]) if "#" in x else 0
-    ):
-        metrics = unified_spreadsheet_data[assigned_label]
-
-        raw_max_len = np.max(metrics["lengths"])
-        final_wid = np.median(metrics["widths"])
-        final_ori = np.median(metrics["orientations"])
-        raw_max_are = np.max(metrics["areas"])
-
-        # --- CSV EXPORT FILTER GATES ---
-        # Re-enforce filters during final CSV log aggregation
-        if final_wid > 6.0 or (80.0 <= abs(final_ori) <= 90.0):
-            continue
-
-        if assigned_label == "Crack#1" or final_ori < -30.0:
-            perspective_scaling_factor = 2.473
-            final_len = raw_max_len * perspective_scaling_factor
-            final_are = raw_max_are * perspective_scaling_factor
-        else:
-            final_len = raw_max_len
-            final_are = raw_max_are
-
-        critical = 1 if (abs(final_ori) > 30.0 and final_wid > 0.30) else 0
-        severity = _severity_from_metrics(final_wid, critical)
-        master_object_log.append({
-            "TimestampUTC": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "Video": os.path.abspath(args.video),
-            "Annotated_Video": annotated_video_path or "",
-            "Type": "Crack",
-            "Severity": severity,
-            "Crack_ID": assigned_label,
-            "Avg_Length_mm": round(final_len, 2),
-            "Avg_Width_mm": round(final_wid, 4),
-            "Avg_Orientation_Deg": round(final_ori, 1),
-            "Avg_Area_mm2": round(final_are, 2),
-            "Total_Frames_Tracked": metrics["frames"],
-            "Critical_Shear_Alert": int(critical),
-            "GSD_mm_per_px": round(last_effective_gsd, 6),
-        })
+    master_object_log = _compile_crack_rows(
+        tracked_cracks,
+        track_id_to_label,
+        source_label,
+        annotated_video_path,
+        last_effective_gsd,
+    )
 
     if not master_object_log:
         print("\n[INFO] Complete. No validated structural crack elements found.")
