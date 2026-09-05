@@ -21,8 +21,8 @@ from ui.theme import ThemeTokens
 
 LIVE_STEPS = [
     "Confirm this PC IP is correct and the Pi answers as lipad@lipad.local (password 109791).",
-    "Click Start live analysis. The app listens on the TCP port, then SSHs in and starts rpicam-vid.",
-    "Frames appear in the annotated live view. Stop live ends analysis and kills the Pi camera command.",
+    "Click Start live analysis. Confirm the Pi SSH link each time you start. The feed appears in the panel to the right.",
+    "Stop live ends analysis and kills rpicam-vid. The next Start will ask for the Pi link again.",
 ]
 
 
@@ -35,10 +35,115 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
         row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8)
     )
 
+    # Live session first so the feed is on-screen with the Start button.
+    live_card = newsprint_card(parent, tokens)
+    live_card.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
+    live_inner = ctk.CTkFrame(live_card, fg_color="transparent")
+    live_inner.pack(fill="both", expand=True, padx=16, pady=14)
+    live_inner.grid_columnconfigure(0, weight=1)
+    live_inner.grid_columnconfigure(1, weight=2)
+
+    controls = ctk.CTkFrame(live_inner, fg_color="transparent")
+    controls.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+    meta_label(controls, tokens, "IMX519 live feed").pack(anchor="w")
+    body_label(
+        controls,
+        tokens,
+        "Frames show in the viewer on the right. Start asks you to confirm the Pi SSH link every time.",
+        wraplength=360,
+    ).pack(anchor="w", pady=(4, 10))
+
+    live_row = ctk.CTkFrame(controls, fg_color="transparent")
+    live_row.pack(fill="x", pady=(0, 8))
+    w_ip, _ = labeled_entry(live_row, tokens, "Pi connects to (PC IP)", app.live_pc_ip, width=150)
+    w_ip.pack(side="left", padx=(0, 12))
+    w_port, _ = labeled_entry(live_row, tokens, "TCP port", app.live_listen_port, width=80)
+    w_port.pack(side="left", padx=(0, 12))
+    w_lw, _ = labeled_entry(live_row, tokens, "Width", app.live_width, width=80)
+    w_lw.pack(side="left", padx=(0, 12))
+    w_lh, _ = labeled_entry(live_row, tokens, "Height", app.live_height, width=80)
+    w_lh.pack(side="left")
+
+    ssh_row = ctk.CTkFrame(controls, fg_color="transparent")
+    ssh_row.pack(fill="x", pady=(0, 8))
+    w_pi, _ = labeled_entry(ssh_row, tokens, "Pi SSH host", app.pi_ssh_host, width=160)
+    w_pi.pack(side="left", padx=(0, 12))
+    w_user, _ = labeled_entry(ssh_row, tokens, "Pi SSH user", app.pi_ssh_user, width=100)
+    w_user.pack(side="left", padx=(0, 12))
+    w_pw, _ = labeled_entry(ssh_row, tokens, "Pi SSH password", app.pi_ssh_password, width=140, show="*")
+    w_pw.pack(side="left")
+
+    body_label(controls, tokens, "Command the app runs on the Raspberry Pi", mono=True).pack(
+        anchor="w", pady=(4, 4)
+    )
+    app.rpicam_cmd_box = ctk.CTkTextbox(
+        controls,
+        height=72,
+        corner_radius=0,
+        font=mono_font(11),
+        wrap="word",
+    )
+    app.rpicam_cmd_box.pack(fill="x", pady=(0, 8))
+    app._refresh_rpicam_command_box()
+    if not getattr(app, "_rpicam_traces_bound", False):
+        for var in (app.live_pc_ip, app.live_listen_port, app.live_width, app.live_height, app.live_bitrate):
+            var.trace_add("write", lambda *_: app._refresh_rpicam_command_box())
+        app._rpicam_traces_bound = True
+
+    live_btns = ctk.CTkFrame(controls, fg_color="transparent")
+    live_btns.pack(fill="x", pady=(0, 8))
+    newsprint_button(live_btns, tokens, "Start live analysis", command=app.start_live_engine_from_ui).pack(
+        side="left", padx=(0, 8)
+    )
+    newsprint_button(live_btns, tokens, "Stop live", command=app.stop_engine_from_ui, variant="secondary").pack(
+        side="left", padx=(0, 8)
+    )
+    newsprint_button(live_btns, tokens, "Copy Pi command", command=app.copy_rpicam_command, variant="secondary").pack(
+        side="left"
+    )
+    app.status_lbl = body_label(controls, tokens, app.last_run_status.get(), mono=True)
+    app.status_lbl.pack(anchor="w")
+
+    preview_wrap = ctk.CTkFrame(live_inner, fg_color=tokens.console_bg, corner_radius=0)
+    preview_wrap.grid(row=0, column=1, sticky="nsew")
+    ph = ctk.CTkFrame(preview_wrap, fg_color="transparent")
+    ph.pack(fill="x", padx=12, pady=(10, 0))
+    meta_label(ph, tokens, "Live viewer", inverted=True).pack(side="left")
+    app._live_preview_caption = ctk.CTkLabel(
+        ph,
+        text="NO SIGNAL" if not app._live_running else "LIVE",
+        text_color=tokens.accent if app._live_running else tokens.inverted_muted,
+        font=mono_font(9, "bold"),
+    )
+    app._live_preview_caption.pack(side="right")
+
+    waiting = app.last_run_status.get() if app._live_running else "Waiting for IMX519 stream…"
+    app.live_preview_lbl = ctk.CTkLabel(
+        preview_wrap,
+        text=waiting,
+        text_color=tokens.console_fg,
+        font=mono_font(12),
+        anchor="center",
+        justify="center",
+        fg_color=tokens.console_bg,
+        width=640,
+        height=360,
+    )
+    app.live_preview_lbl.pack(fill="both", expand=True, padx=12, pady=12)
+    ctk.CTkLabel(
+        preview_wrap,
+        text="This panel is the live feed. Annotated frames appear here after the model loads the first TCP packet.",
+        text_color=tokens.inverted_muted,
+        font=sans_font(12),
+        anchor="w",
+        justify="left",
+        wraplength=620,
+    ).pack(anchor="w", padx=12, pady=(0, 12))
+
     left = ctk.CTkFrame(parent, fg_color="transparent")
-    left.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+    left.grid(row=2, column=0, sticky="nsew", padx=(0, 16))
     right = ctk.CTkFrame(parent, fg_color="transparent")
-    right.grid(row=1, column=1, sticky="nsew")
+    right.grid(row=2, column=1, sticky="nsew")
 
     # Target card
     target_card = newsprint_card(left, tokens)
@@ -87,7 +192,9 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
     inner = ctk.CTkFrame(media_card, fg_color="transparent")
     inner.pack(fill="both", expand=True, padx=16, pady=14)
     meta_label(inner, tokens, "Media hub").pack(anchor="w")
-    body_label(inner, tokens, "MP4 queue", mono=True).pack(anchor="w", pady=(4, 10))
+    body_label(inner, tokens, "MP4 queue — recorded files, not the live camera", mono=True).pack(
+        anchor="w", pady=(4, 10)
+    )
 
     actions = ctk.CTkFrame(inner, fg_color="transparent")
     actions.pack(fill="x", pady=(0, 10))
@@ -122,84 +229,9 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
         side="left", padx=(0, 8)
     )
     newsprint_button(run_row, tokens, "Stop", command=app.stop_engine_from_ui, variant="secondary").pack(side="left")
-    app.status_lbl = body_label(inner, tokens, app.last_run_status.get(), mono=True)
-    app.status_lbl.pack(anchor="w", pady=(10, 0))
+    app._file_status_lbl = body_label(inner, tokens, app.last_run_status.get(), mono=True)
+    app._file_status_lbl.pack(anchor="w", pady=(10, 0))
     app._refresh_video_list()
-
-    ctk.CTkFrame(inner, height=1, fg_color=tokens.border, corner_radius=0).pack(fill="x", pady=14)
-    meta_label(inner, tokens, "IMX519 live feed").pack(anchor="w")
-    body_label(
-        inner,
-        tokens,
-        "Click Start live analysis. This PC listens on the TCP port, then the app SSHs to "
-        "lipad@lipad.local and starts rpicam-vid for you. Confirm the PC IP is this machine.",
-        wraplength=520,
-    ).pack(anchor="w", pady=(4, 10))
-
-    live_row = ctk.CTkFrame(inner, fg_color="transparent")
-    live_row.pack(fill="x", pady=(0, 8))
-    w_ip, _ = labeled_entry(live_row, tokens, "Pi connects to (PC IP)", app.live_pc_ip, width=150)
-    w_ip.pack(side="left", padx=(0, 12))
-    w_port, _ = labeled_entry(live_row, tokens, "TCP port", app.live_listen_port, width=80)
-    w_port.pack(side="left", padx=(0, 12))
-    w_lw, _ = labeled_entry(live_row, tokens, "Width", app.live_width, width=80)
-    w_lw.pack(side="left", padx=(0, 12))
-    w_lh, _ = labeled_entry(live_row, tokens, "Height", app.live_height, width=80)
-    w_lh.pack(side="left")
-
-    ssh_row = ctk.CTkFrame(inner, fg_color="transparent")
-    ssh_row.pack(fill="x", pady=(0, 8))
-    w_pi, _ = labeled_entry(ssh_row, tokens, "Pi SSH host", app.pi_ssh_host, width=160)
-    w_pi.pack(side="left", padx=(0, 12))
-    w_user, _ = labeled_entry(ssh_row, tokens, "Pi SSH user", app.pi_ssh_user, width=100)
-    w_user.pack(side="left", padx=(0, 12))
-    w_pw, _ = labeled_entry(ssh_row, tokens, "Pi SSH password", app.pi_ssh_password, width=140, show="*")
-    w_pw.pack(side="left")
-
-    body_label(inner, tokens, "Command the app runs on the Raspberry Pi", mono=True).pack(anchor="w", pady=(4, 4))
-    app.rpicam_cmd_box = ctk.CTkTextbox(
-        inner,
-        height=72,
-        corner_radius=0,
-        font=mono_font(11),
-        wrap="word",
-    )
-    app.rpicam_cmd_box.pack(fill="x", pady=(0, 8))
-    app._refresh_rpicam_command_box()
-    if not getattr(app, "_rpicam_traces_bound", False):
-        for var in (app.live_pc_ip, app.live_listen_port, app.live_width, app.live_height, app.live_bitrate):
-            var.trace_add("write", lambda *_: app._refresh_rpicam_command_box())
-        app._rpicam_traces_bound = True
-
-    live_btns = ctk.CTkFrame(inner, fg_color="transparent")
-    live_btns.pack(fill="x", pady=(0, 4))
-    newsprint_button(live_btns, tokens, "Start live analysis", command=app.start_live_engine_from_ui).pack(
-        side="left", padx=(0, 8)
-    )
-    newsprint_button(live_btns, tokens, "Stop live", command=app.stop_engine_from_ui, variant="secondary").pack(
-        side="left", padx=(0, 8)
-    )
-    newsprint_button(live_btns, tokens, "Copy Pi command", command=app.copy_rpicam_command, variant="secondary").pack(
-        side="left"
-    )
-
-    # Status panel + live view
-    preview_card = newsprint_card(right, tokens)
-    preview_card.pack(fill="both", expand=True, pady=(0, 12))
-    pv = ctk.CTkFrame(preview_card, fg_color="transparent")
-    pv.pack(fill="both", expand=True, padx=16, pady=14)
-    meta_label(pv, tokens, "Annotated live view").pack(anchor="w")
-    app.live_preview_lbl = ctk.CTkLabel(
-        pv,
-        text="Waiting for IMX519 stream…",
-        text_color=tokens.muted,
-        font=mono_font(12),
-        anchor="center",
-        justify="center",
-        width=420,
-        height=236,
-    )
-    app.live_preview_lbl.pack(fill="both", expand=True, pady=(10, 0))
 
     status_card = newsprint_card(right, tokens, inverted=True)
     status_card.pack(fill="x")
@@ -208,7 +240,7 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
     meta_label(si, tokens, "How to start live", inverted=True).pack(anchor="w")
     ctk.CTkLabel(
         si,
-        text="No Pi terminal needed",
+        text="Watch the live viewer above",
         text_color=tokens.inverted_fg,
         font=sans_font(16, "bold"),
         anchor="w",

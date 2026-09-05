@@ -97,7 +97,9 @@ class LiveTcpFrameSource:
         self._proc: subprocess.Popen | None = None
         self._cap: cv2.VideoCapture | None = None
         self._thread: threading.Thread | None = None
-        self._use_ffmpeg = shutil.which("ffmpeg") is not None
+        self._opencv_deferred = False
+        self._ffmpeg_bin = shutil.which("ffmpeg")
+        self._use_ffmpeg = self._ffmpeg_bin is not None
 
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
             "fflags;nobuffer+discardcorrupt|flags;low_delay|"
@@ -114,20 +116,33 @@ class LiveTcpFrameSource:
         )
         try:
             if self._use_ffmpeg:
-                self._start_ffmpeg()
+                try:
+                    self._start_ffmpeg()
+                except (OSError, RuntimeError) as exc:
+                    print(
+                        f"[LIVE] ffmpeg spawn failed ({exc}). "
+                        "Opening OpenCV TCP listen in the background so the Pi can still connect.",
+                        flush=True,
+                    )
+                    self._use_ffmpeg = False
+                    self._opencv_deferred = True
             else:
-                self._start_opencv()
+                print("[LIVE] ffmpeg not on PATH — using OpenCV TCP listen.", flush=True)
+                self._opencv_deferred = True
         except Exception:
             self._ffmpeg_log.close()
             raise
 
         self._thread = threading.Thread(target=self._drain, daemon=True, name="imx519-drain")
         self._thread.start()
+        if self._opencv_deferred:
+            time.sleep(0.35)
 
     def _ffmpeg_cmd(self) -> list[str]:
         url = f"tcp://{self.host}:{self.port}"
+        binary = self._ffmpeg_bin or "ffmpeg"
         return [
-            "ffmpeg",
+            binary,
             "-hide_banner",
             "-nostats",
             "-loglevel",
@@ -151,8 +166,8 @@ class LiveTcpFrameSource:
             "bgr24",
             "-f",
             "rawvideo",
-            "-vsync",
-            "0",
+            "-fps_mode",
+            "passthrough",
             "pipe:1",
         ]
 
@@ -160,13 +175,27 @@ class LiveTcpFrameSource:
         kwargs: dict = {
             "stdout": subprocess.PIPE,
             "stderr": self._ffmpeg_log,
+            "stdin": subprocess.DEVNULL,
             "bufsize": 0,
         }
         if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            flags |= no_window
+            kwargs["creationflags"] = flags
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
         self._proc = subprocess.Popen(self._ffmpeg_cmd(), **kwargs)
         if self._proc.stdout is None:
             raise RuntimeError("ffmpeg stdout pipe was not created")
+        time.sleep(0.35)
+        if self._proc.poll() is not None:
+            raise RuntimeError(
+                f"ffmpeg exited immediately with code {self._proc.returncode}. "
+                "Check data/ffmpeg_live.log."
+            )
 
     def _start_opencv(self) -> None:
         url = f"tcp://{self.host}:{self.port}?listen=1"
@@ -187,6 +216,9 @@ class LiveTcpFrameSource:
 
     def _drain(self) -> None:
         try:
+            if self._opencv_deferred and self._proc is None:
+                print("[LIVE] Waiting for IMX519 TCP client (OpenCV listen)…", flush=True)
+                self._start_opencv()
             if self._proc is not None:
                 while self._running:
                     raw = self._readexact(self._frame_size)

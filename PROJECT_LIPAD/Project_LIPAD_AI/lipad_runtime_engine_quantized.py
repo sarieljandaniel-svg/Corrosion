@@ -21,7 +21,6 @@ if _AI_DIR not in sys.path:
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 from live_tcp_capture import PreviewJpegPublisher, mark_listen_ready, open_video_source
 
@@ -589,6 +588,8 @@ def main():
         )
         mark_listen_ready(args.ready_flag)
         print("[LIVE] TCP listener is bound. Start rpicam-vid on the Pi now.")
+
+    from ultralytics import YOLO
 
     try:
         model = YOLO(args.weights, task="segment")

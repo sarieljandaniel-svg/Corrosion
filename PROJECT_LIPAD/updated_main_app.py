@@ -18,6 +18,7 @@ from ui.pages.analysis import render_analysis
 from ui.pages.home import render_home
 from ui.pages.inspection import render_inspection
 from ui.pages.reports import render_reports
+from ui.pi_link import show_pi_link_dialog
 from ui.sidebar import build_sidebar
 from ui.telemetry import TelemetryListener, TelemetryPacket
 from ui.theme import ThemeMode, get_tokens
@@ -34,14 +35,6 @@ class LipadQuantizedApp(ctk.CTk):
     ):
         super().__init__()
         self.weights_path = weights_path
-
-        # --- PRE-LOAD SEGMENTATION TASK HERE ---
-        try:
-            from ultralytics import YOLO
-            YOLO(self.weights_path, task="segment") 
-        except Exception as e:
-            print(f"Model pre-load warning: {e}")
-        # ---------------------------------------
 
         self.title("Project LiPAD — Quantized YOLO Execution")
         self.geometry("1280x860")
@@ -163,6 +156,14 @@ class LipadQuantizedApp(ctk.CTk):
         if hasattr(self, "_distance_value") and self._distance_value.winfo_exists():
             d = self.current_lidar_distance
             self._distance_value.configure(text=f"{d:.1f} mm" if d is not None else "— mm")
+        if hasattr(self, "_live_status_value") and self._live_status_value.winfo_exists():
+            if self._live_running:
+                live_text = "Streaming"
+            elif self.engine_process is not None:
+                live_text = "Analyzing"
+            else:
+                live_text = self.last_run_status.get() or "Idle"
+            self._live_status_value.configure(text=live_text)
         if hasattr(self, "_last_packet_value") and self._last_packet_value.winfo_exists():
             if packet:
                 self._last_packet_value.configure(text=f"{packet.source_ip} · {packet.timestamp}")
@@ -200,6 +201,11 @@ class LipadQuantizedApp(ctk.CTk):
             self.selected_video_lbl.configure(text=self._selected_video_label_text())
         if hasattr(self, "_engine_status_lbl") and self._engine_status_lbl.winfo_exists():
             self._engine_status_lbl.configure(text=text)
+        if hasattr(self, "_file_status_lbl") and self._file_status_lbl.winfo_exists():
+            self._file_status_lbl.configure(text=text)
+        self._refresh_live_preview_chrome(text)
+        if hasattr(self, "_live_status_value") and self._live_status_value.winfo_exists():
+            self._refresh_home_metrics()
 
     def _selected_video_label_text(self) -> str:
         if self.selected_video_index is None:
@@ -449,6 +455,9 @@ class LipadQuantizedApp(ctk.CTk):
         try:
             mtime = os.path.getmtime(path)
         except OSError:
+            if not self._live_running:
+                return
+            lbl.configure(image="", text=self.last_run_status.get() or "Waiting for first live frame…")
             return
         if mtime == self._live_preview_mtime and getattr(lbl, "_lipad_mtime", None) == mtime:
             return
@@ -456,7 +465,7 @@ class LipadQuantizedApp(ctk.CTk):
             img = Image.open(path)
             img.load()
             img = img.convert("RGB")
-            img.thumbnail((640, 360))
+            img.thumbnail((720, 405))
             ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
             self._live_preview_imgtk = ctk_img
             self._live_preview_mtime = mtime
@@ -464,6 +473,36 @@ class LipadQuantizedApp(ctk.CTk):
             lbl.configure(image=ctk_img, text="")
         except Exception:
             pass
+
+    def _refresh_live_preview_chrome(self, status_text: str | None = None) -> None:
+        caption = getattr(self, "_live_preview_caption", None)
+        if caption is not None and caption.winfo_exists():
+            caption.configure(
+                text="LIVE" if self._live_running else "NO SIGNAL",
+                text_color=self.tokens.accent if self._live_running else self.tokens.inverted_muted,
+            )
+        lbl = getattr(self, "live_preview_lbl", None)
+        if lbl is None or not lbl.winfo_exists():
+            return
+        path = self._live_preview_path()
+        if os.path.exists(path) and self._live_running:
+            return
+        msg = status_text or self.last_run_status.get() or "Waiting for IMX519 stream…"
+        try:
+            lbl.configure(image="", text=msg)
+        except Exception:
+            pass
+
+    def _clear_live_preview(self) -> None:
+        self._live_preview_mtime = None
+        self._live_preview_imgtk = None
+        path = self._live_preview_path()
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        self._refresh_live_preview_chrome("Live analysis stopped. Start again to confirm the Pi link.")
 
     def _schedule_live_preview(self) -> None:
         if self._live_preview_job is not None:
@@ -503,6 +542,8 @@ class LipadQuantizedApp(ctk.CTk):
             username=user,
             password=password,
             timeout=10,
+            banner_timeout=10,
+            auth_timeout=10,
             look_for_keys=False,
             allow_agent=False,
         )
@@ -544,9 +585,9 @@ class LipadQuantizedApp(ctk.CTk):
         except Exception as e:
             self._pi_ssh_client = None
             self._pi_ssh_channel = None
-            self.after(0, lambda: self._set_status(
-                f"SSH to {user}@{host} failed ({e}). Check the Pi is on the LAN and SSH is enabled."
-            ))
+            err = str(e)
+            target = f"{user}@{host}"
+            self.after(0, lambda msg=f"SSH to {target} failed ({err}). Check the Pi is on the LAN and SSH is enabled.": self._set_status(msg))
 
     def _stop_pi_rpicam(self) -> None:
         proc = self._pi_ssh_process
@@ -576,7 +617,37 @@ class LipadQuantizedApp(ctk.CTk):
 
         threading.Thread(target=_kill, daemon=True).start()
 
+    def _engine_failure_hint(self) -> str:
+        log_path = os.path.join(self._data_dir(), "engine_error.log")
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                lines = [ln.strip() for ln in fh.readlines() if ln.strip()]
+        except OSError:
+            return "Live engine failed. Check data/engine_error.log"
+        if not lines:
+            return "Live engine failed. Check data/engine_error.log"
+        last = lines[-1]
+        joined = "\n".join(lines)
+        if "WinError 1455" in joined or "paging file is too small" in joined.lower():
+            return (
+                "Live engine ran out of virtual memory while starting the camera listener. "
+                "Close other heavy apps and try again. Details: data/engine_error.log"
+            )
+        if last.startswith("OSError:") or last.startswith("RuntimeError:") or last.startswith("[CRITICAL"):
+            return last
+        return f"Live engine failed: {last}"
+
     def start_live_engine_from_ui(self) -> None:
+        with self.engine_lock:
+            if self.engine_process is not None:
+                self._set_status("Engine already running. Stop it first.")
+                return
+        self._set_status("Checking Raspberry Pi connection…")
+        show_pi_link_dialog(self, self.tokens, on_confirm=self._launch_live_engine)
+
+    def _launch_live_engine(self) -> None:
+        if self.current_tab != "inspection_manager":
+            self.select_tab("inspection_manager")
         with self.engine_lock:
             if self.engine_process is not None:
                 self._set_status("Engine already running. Stop it first.")
@@ -623,9 +694,11 @@ class LipadQuantizedApp(ctk.CTk):
             log_file_path = os.path.join(self._data_dir(), "engine_error.log")
             try:
                 with open(log_file_path, "w") as log_file:
+                    env = os.environ.copy()
+                    env["PYTHONUNBUFFERED"] = "1"
                     with self.engine_lock:
                         self.engine_process = subprocess.Popen(
-                            cmd, stdout=log_file, stderr=log_file, text=True
+                            cmd, stdout=log_file, stderr=log_file, text=True, env=env
                         )
                         proc = self.engine_process
                     deadline = time.time() + 25
@@ -643,11 +716,11 @@ class LipadQuantizedApp(ctk.CTk):
                     self.engine_stop_requested = False
                 self._live_running = False
                 self._stop_pi_rpicam()
+                self.after(0, self._clear_live_preview)
                 self.last_output_csv_path = self._morph_results_path()
                 if code != 0:
-                    self.after(0, lambda: self._set_status(
-                        "Live analysis stopped." if stopped else "Live engine failed. Check data/engine_error.log"
-                    ))
+                    msg = "Live analysis stopped." if stopped else self._engine_failure_hint()
+                    self.after(0, lambda m=msg: self._set_status(m))
                     return
                 self.after(0, lambda: self._set_status("Live analysis complete. Open Analysis Overview."))
             except Exception as ex:
@@ -733,6 +806,7 @@ class LipadQuantizedApp(ctk.CTk):
         self._terminate_engine_process(proc)
         self._live_running = False
         self._stop_pi_rpicam()
+        self._clear_live_preview()
         self._set_status("Stopping analysis...")
 
     def _terminate_engine_process(self, proc: subprocess.Popen) -> None:
