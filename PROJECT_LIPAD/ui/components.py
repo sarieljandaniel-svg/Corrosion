@@ -121,9 +121,19 @@ def badge(parent, tokens: ThemeTokens, text: str, tone: str = "default", inverte
     return frame
 
 
-def labeled_entry(parent, tokens: ThemeTokens, label: str, textvariable=None, width: int = 160) -> tuple[ctk.CTkFrame, ctk.CTkEntry]:
+def labeled_entry(
+    parent,
+    tokens: ThemeTokens,
+    label: str,
+    textvariable=None,
+    width: int = 160,
+    show: str | None = None,
+) -> tuple[ctk.CTkFrame, ctk.CTkEntry]:
     wrap = ctk.CTkFrame(parent, fg_color="transparent")
     meta_label(wrap, tokens, label).pack(anchor="w", pady=(0, 4))
+    entry_kwargs = {}
+    if show is not None:
+        entry_kwargs["show"] = show
     entry = ctk.CTkEntry(
         wrap,
         textvariable=textvariable,
@@ -134,6 +144,7 @@ def labeled_entry(parent, tokens: ThemeTokens, label: str, textvariable=None, wi
         fg_color="transparent",
         text_color=tokens.fg,
         font=mono_font(12),
+        **entry_kwargs,
     )
     entry.pack(fill="x")
     ctk.CTkFrame(wrap, height=1, fg_color=tokens.border, corner_radius=0).pack(fill="x", pady=(2, 0))

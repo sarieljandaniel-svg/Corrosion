@@ -1,14 +1,16 @@
 [INFO] GSD mode: hypothetical — 0.5436 mm/px
 [INFO] Booting Quantized Project LIPAD Engine with BoT-SORT Tracking...
+[LIVE] Listening for IMX519 MPEG-TS on tcp://0.0.0.0:5000 (1280x720, low_delay)
+[LIVE] TCP listener is bound. Start rpicam-vid on the Pi now.
 [SYSTEM] Quantized model loaded — device: cpu
   • C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\models\best.onnx
-[SYSTEM] High-Fidelity Processing Canvas Locked: 1124x608
-Loading C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\models\best.onnx for ONNX Runtime inference...
-Using ONNX Runtime 1.28.0 with CPUExecutionProvider
+[SYSTEM] High-Fidelity Processing Canvas Locked: 1280x720
 
 [COMPILE] Unifying and compiling database spreadsheet rows...
+
+[INFO] Complete. No validated structural crack elements found.
 [SUCCESS] Morphological results saved to:
-👉 C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\data\MorphologicalResults.csv
+👉 C:\Users\Admin\Project_LIPAD_v3\Corrosion\PROJECT_LIPAD\data\MorphologicalResults.csv
 [SUCCESS] UI mirror results saved to:
-👉 C:\Users\Admin\PROJECT_LIPAD\Corrosion\PROJECT_LIPAD\data\results.csv
-[INFO] GSD source used: hypothetical
+👉 C:\Users\Admin\Project_LIPAD_v3\Corrosion\PROJECT_LIPAD\data\results.csv
+[INFO] GSD source used: manual_override

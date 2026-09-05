@@ -15,8 +15,15 @@ from ui.components import (
     newsprint_card,
     page_header,
     configure_tree_style,
+    sans_font,
 )
 from ui.theme import ThemeTokens
+
+LIVE_STEPS = [
+    "Confirm this PC IP is correct and the Pi answers as lipad@lipad.local (password 109791).",
+    "Click Start live analysis. The app listens on the TCP port, then SSHs in and starts rpicam-vid.",
+    "Frames appear in the annotated live view. Stop live ends analysis and kills the Pi camera command.",
+]
 
 
 def render_inspection(app, parent, tokens: ThemeTokens) -> None:
@@ -124,7 +131,8 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
     body_label(
         inner,
         tokens,
-        "PC listens first (same as ffplay -listen 1), then the Pi connects with rpicam-vid.",
+        "Click Start live analysis. This PC listens on the TCP port, then the app SSHs to "
+        "lipad@lipad.local and starts rpicam-vid for you. Confirm the PC IP is this machine.",
         wraplength=520,
     ).pack(anchor="w", pady=(4, 10))
 
@@ -141,23 +149,14 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
 
     ssh_row = ctk.CTkFrame(inner, fg_color="transparent")
     ssh_row.pack(fill="x", pady=(0, 8))
-    w_pi, _ = labeled_entry(ssh_row, tokens, "Pi SSH host (optional)", app.pi_ssh_host, width=160)
+    w_pi, _ = labeled_entry(ssh_row, tokens, "Pi SSH host", app.pi_ssh_host, width=160)
     w_pi.pack(side="left", padx=(0, 12))
     w_user, _ = labeled_entry(ssh_row, tokens, "Pi SSH user", app.pi_ssh_user, width=100)
     w_user.pack(side="left", padx=(0, 12))
-    ssh_wrap = ctk.CTkFrame(ssh_row, fg_color="transparent")
-    ssh_wrap.pack(side="left", padx=(8, 0))
-    meta_label(ssh_wrap, tokens, "Auto-start camera").pack(anchor="w", pady=(0, 4))
-    ctk.CTkCheckBox(
-        ssh_wrap,
-        text="SSH rpicam-vid",
-        variable=app.live_auto_ssh,
-        font=mono_font(11),
-        fg_color=tokens.button_primary_bg,
-        hover_color=tokens.hover,
-    ).pack(anchor="w")
+    w_pw, _ = labeled_entry(ssh_row, tokens, "Pi SSH password", app.pi_ssh_password, width=140, show="*")
+    w_pw.pack(side="left")
 
-    body_label(inner, tokens, "Command to run on the Raspberry Pi", mono=True).pack(anchor="w", pady=(4, 4))
+    body_label(inner, tokens, "Command the app runs on the Raspberry Pi", mono=True).pack(anchor="w", pady=(4, 4))
     app.rpicam_cmd_box = ctk.CTkTextbox(
         inner,
         height=72,
@@ -206,7 +205,28 @@ def render_inspection(app, parent, tokens: ThemeTokens) -> None:
     status_card.pack(fill="x")
     si = ctk.CTkFrame(status_card, fg_color="transparent")
     si.pack(fill="x", padx=16, pady=16)
-    meta_label(si, tokens, "Engine status", inverted=True).pack(anchor="w")
+    meta_label(si, tokens, "How to start live", inverted=True).pack(anchor="w")
+    ctk.CTkLabel(
+        si,
+        text="No Pi terminal needed",
+        text_color=tokens.inverted_fg,
+        font=sans_font(16, "bold"),
+        anchor="w",
+    ).pack(anchor="w", pady=(6, 10))
+    for i, step in enumerate(LIVE_STEPS, start=1):
+        ctk.CTkLabel(si, text=f"0{i}", text_color=tokens.accent, font=mono_font(12, "bold")).pack(
+            anchor="w"
+        )
+        ctk.CTkLabel(
+            si,
+            text=step,
+            text_color=tokens.inverted_fg,
+            font=sans_font(12),
+            anchor="w",
+            justify="left",
+            wraplength=240,
+        ).pack(anchor="w", pady=(2, 10))
+    meta_label(si, tokens, "Engine status", inverted=True).pack(anchor="w", pady=(4, 0))
     badge_row = ctk.CTkFrame(si, fg_color="transparent")
     badge_row.pack(anchor="w", pady=(10, 0))
     app._engine_badge = badge(badge_row, tokens, app.last_run_status.get().lower(), tone="inverted")

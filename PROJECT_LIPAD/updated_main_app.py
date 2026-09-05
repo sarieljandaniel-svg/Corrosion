@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -77,11 +76,14 @@ class LipadQuantizedApp(ctk.CTk):
         self.live_width = ctk.StringVar(value="1280")
         self.live_height = ctk.StringVar(value="720")
         self.live_bitrate = ctk.StringVar(value="3000000")
-        self.pi_ssh_host = ctk.StringVar(value="")
-        self.pi_ssh_user = ctk.StringVar(value="pi")
-        self.live_auto_ssh = ctk.BooleanVar(value=False)
+        self.pi_ssh_host = ctk.StringVar(value="lipad.local")
+        self.pi_ssh_user = ctk.StringVar(value="lipad")
+        self.pi_ssh_password = ctk.StringVar(value="109791")
+        self.live_auto_ssh = ctk.BooleanVar(value=True)
         self._live_running = False
         self._pi_ssh_process = None
+        self._pi_ssh_client = None
+        self._pi_ssh_channel = None
         self._live_preview_job = None
         self._live_preview_imgtk = None
         self._live_preview_mtime = None
@@ -480,29 +482,71 @@ class LipadQuantizedApp(ctk.CTk):
         self._apply_preview_image(getattr(self, "analysis_live_preview_lbl", None))
         self._live_preview_job = self.after(40, self._tick_live_preview)
 
-    def _start_pi_rpicam(self) -> None:
-        host = (self.pi_ssh_host.get() or "").strip()
-        user = (self.pi_ssh_user.get() or "pi").strip()
-        if not host:
-            self._set_status("Listener is up. Run the rpicam-vid command on the Pi.")
+    def _parse_pi_ssh_target(self) -> tuple[str, str, str]:
+        user = (self.pi_ssh_user.get() or "lipad").strip()
+        host = (self.pi_ssh_host.get() or "lipad.local").strip()
+        password = self.pi_ssh_password.get() or "109791"
+        raw = host
+        if raw.lower().startswith("ssh "):
+            raw = raw[4:].strip()
+        if "@" in raw and " " not in raw:
+            user, host = raw.rsplit("@", 1)
+        return user, host, password
+
+    def _ssh_exec_paramiko(self, user: str, host: str, password: str, remote: str, keep_alive: bool) -> None:
+        import paramiko
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=host,
+            username=user,
+            password=password,
+            timeout=10,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        if keep_alive:
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(15)
+            _stdin, stdout, _stderr = client.exec_command(remote, get_pty=True)
+            self._pi_ssh_client = client
+            self._pi_ssh_channel = stdout.channel
             return
-        if shutil.which("ssh") is None:
-            self._set_status("ssh not found. Run the rpicam-vid command on the Pi instead.")
+        try:
+            _stdin, stdout, stderr = client.exec_command(remote, timeout=8)
+            stdout.channel.recv_exit_status()
+            _ = stderr.read()
+        finally:
+            client.close()
+
+    def _start_pi_rpicam(self) -> None:
+        user, host, password = self._parse_pi_ssh_target()
+        if not host:
+            self.after(0, lambda: self._set_status(
+                "Listener is up, but SSH host is empty. Set lipad@lipad.local to start the camera."
+            ))
             return
         remote = self.rpicam_command_text()
-        cmd = [
-            "ssh",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=8",
-            f"{user}@{host}",
-            remote,
-        ]
         try:
-            self._pi_ssh_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._set_status(f"Live analysis listening — started rpicam on {user}@{host}")
+            import paramiko  # noqa: F401
+        except ImportError:
+            self.after(0, lambda: self._set_status(
+                "paramiko is missing. Run: pip install paramiko"
+            ))
+            return
+        try:
+            self._ssh_exec_paramiko(user, host, password, remote, keep_alive=True)
+            self.after(0, lambda: self._set_status(
+                f"Listener ready — started rpicam-vid on {user}@{host}"
+            ))
         except Exception as e:
-            self._pi_ssh_process = None
-            self._set_status(f"SSH rpicam failed ({e}). Run the command on the Pi.")
+            self._pi_ssh_client = None
+            self._pi_ssh_channel = None
+            self.after(0, lambda: self._set_status(
+                f"SSH to {user}@{host} failed ({e}). Check the Pi is on the LAN and SSH is enabled."
+            ))
 
     def _stop_pi_rpicam(self) -> None:
         proc = self._pi_ssh_process
@@ -512,21 +556,25 @@ class LipadQuantizedApp(ctk.CTk):
                 proc.terminate()
             except Exception:
                 pass
-        host = (self.pi_ssh_host.get() or "").strip()
-        user = (self.pi_ssh_user.get() or "pi").strip()
-        if host and shutil.which("ssh"):
+        self._pi_ssh_channel = None
+        client = self._pi_ssh_client
+        self._pi_ssh_client = None
+        if client is not None:
             try:
-                subprocess.Popen(
-                    [
-                        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                        f"{user}@{host}",
-                        "pkill -f rpicam-vid || true",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                client.close()
             except Exception:
                 pass
+        user, host, password = self._parse_pi_ssh_target()
+        if not host:
+            return
+
+        def _kill() -> None:
+            try:
+                self._ssh_exec_paramiko(user, host, password, "pkill -f rpicam-vid || true", keep_alive=False)
+            except Exception:
+                pass
+
+        threading.Thread(target=_kill, daemon=True).start()
 
     def start_live_engine_from_ui(self) -> None:
         with self.engine_lock:
@@ -569,7 +617,7 @@ class LipadQuantizedApp(ctk.CTk):
 
         def _runner() -> None:
             self.after(0, lambda: self._set_status(
-                f"Listening on {host}:{port} (like ffplay -listen 1). Start rpicam-vid on the Pi."
+                f"Listening on {host}:{port}. Waiting to auto-start rpicam-vid over SSH…"
             ))
             self.after(0, self._schedule_live_preview)
             log_file_path = os.path.join(self._data_dir(), "engine_error.log")
@@ -585,12 +633,8 @@ class LipadQuantizedApp(ctk.CTk):
                         if os.path.exists(ready_flag) or proc.poll() is not None:
                             break
                         time.sleep(0.1)
-                    if self.live_auto_ssh.get() and proc.poll() is None:
-                        self.after(0, self._start_pi_rpicam)
-                    elif os.path.exists(ready_flag) and proc.poll() is None:
-                        self.after(0, lambda: self._set_status(
-                            f"Listener ready on {host}:{port}. Run rpicam-vid on the Pi now."
-                        ))
+                    if proc.poll() is None:
+                        self._start_pi_rpicam()
                     code = proc.wait()
 
                 with self.engine_lock:
